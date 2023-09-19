@@ -1,0 +1,315 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install transformers
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm.auto import tqdm
+import random
+import os
+
+import torch
+from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+
+def reset_seeds(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+SEED = 42
+
+# 현재 device 확인
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device
+
+DATA_PATH = "/content/drive/MyDrive/2조_누구냐, 넌!/04. 기타자료/Naver_shopping_크롤링/토픽분류/추가csv파일/"
+
+DATA_PATH_2 = "/content/drive/MyDrive/2조_누구냐, 넌!/04. 기타자료/Naver_shopping_크롤링/토픽분류/이진분류_추가_model_weight/"
+
+DATA_PATH_3 = "/content/drive/MyDrive/2조_누구냐, 넌!/04. 기타자료/Naver_shopping_크롤링/토픽분류/"
+
+df = pd.read_csv(f"{DATA_PATH}세정력추가.csv")
+df.head()
+
+df.info()
+
+model_name = "beomi/KcELECTRA-base-v2022"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained("beomi/KcELECTRA-base-v2022")
+
+train_token = tokenizer(df['content'].tolist(), padding="max_length", truncation=True)
+
+input_ids = np.array(train_token['input_ids'])
+attention_mask = np.array(train_token['attention_mask'])
+token_type_ids = np.array(train_token['token_type_ids'])
+
+input_ids.shape, attention_mask.shape, token_type_ids.shape
+
+topic = '세정력/거품'
+
+# target_1 : 이진분류
+target = np.where(df[topic] >= 0, 1, 0)
+
+target.shape
+
+target[:5920]
+
+df.loc[df['세정력'].isnull(), '세정력'] = target[:5920]
+
+target = np.array(df['세정력']).reshape(-1, 1)
+target.shape
+
+class ReviewDataset(torch.utils.data.Dataset):
+    def __init__(self, input_ids, attention_mask, token_type_ids, y=None):
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
+        self.token_type_ids = token_type_ids
+        self.y = y
+
+
+    def __len__(self):
+        return self.input_ids.shape[0]
+
+    def __getitem__(self, idx):
+        item = {}
+        item['input_ids'] = torch.tensor(self.input_ids[idx])
+        item['attention_mask'] = torch.tensor(self.attention_mask[idx])
+        item['token_type_ids'] = torch.tensor(self.token_type_ids[idx])
+        if self.y is not None:
+            item['y'] = torch.Tensor(self.y[idx])
+
+        return item
+
+dt = ReviewDataset(input_ids, attention_mask, token_type_ids, target)
+dl = torch.utils.data.DataLoader(dt,batch_size=2)
+batch = next(iter(dl))
+batch
+
+batch['y'].dtype
+
+class Net(torch.nn.Module):
+    def __init__(self, model_name):
+        super().__init__()
+        self.model = AutoModel.from_pretrained(model_name)
+        self.output_layer = torch.nn.Linear( self.model.config.hidden_size , 1)
+
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        x = self.model(input_ids, attention_mask, token_type_ids)
+        x = self.output_layer(x[0][:,0])
+        return x
+
+# model = Net(model_name)
+# x = model(batch["input_ids"], batch['attention_mask'], batch['token_type_ids'])
+# x
+
+def train_loop(dataloader, model, bce_loss_fn, optimizer, device):
+    epoch_loss = 0
+    model.train() # 모델 객체를 학습모드로 전환
+    for batch in tqdm(dataloader):
+        pred = model(batch["input_ids"].to(device), batch['attention_mask'].to(device), batch['token_type_ids'].to(device))
+
+        # 이진분류 loss
+        bce_loss = bce_loss_fn(pred, batch["y"].to(device))
+
+        optimizer.zero_grad()
+        bce_loss.backward()
+        optimizer.step()
+
+        epoch_loss += bce_loss.item()
+
+    epoch_loss /= len(dataloader)
+
+    return epoch_loss
+
+@torch.no_grad()
+def test_loop(dataloader,model,bce_loss_fn, device):
+    model.eval() # 평가 모드
+    sig = torch.nn.Sigmoid()
+    pred_list = []
+
+    epoch_loss = 0
+    for batch in tqdm(dataloader):
+        pred = model(batch["input_ids"].to(device), batch['attention_mask'].to(device), batch['token_type_ids'].to(device))
+
+        # 검증 평가할 경우
+        if batch.get("y") is not None:
+            bce_loss = bce_loss_fn(pred, batch["y"].to(device))
+
+            epoch_loss += bce_loss.item()
+
+        # 예측값 만들기
+        pred = sig(pred).to("cpu").numpy()
+
+        pred_list.append(pred)
+
+    pred = np.concatenate(pred_list)
+    epoch_loss /= len(dataloader)
+    return epoch_loss, pred
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+batch_size = 4
+bce_loss_fn = torch.nn.BCEWithLogitsLoss()
+epochs = 100
+n_splits = 5
+cv = StratifiedKFold(n_splits=n_splits, random_state=SEED, shuffle=True)
+
+is_holdout = False
+reset_seeds(SEED)
+best_score_list = []
+best_recall_score_list = []
+best_precision_score_list = []
+valid_pred_list = []
+valid_true_list = []
+
+for i, (tri, vai) in enumerate(cv.split(input_ids, target)):
+    model = Net(model_name).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5)
+
+    # 학습용
+    train_dt = ReviewDataset(input_ids[tri], attention_mask[tri], token_type_ids[tri], target[tri])
+    train_dl = torch.utils.data.DataLoader(train_dt, batch_size=batch_size, shuffle=True)
+
+    # 검증용
+    valid_dt = ReviewDataset(input_ids[vai], attention_mask[vai], token_type_ids[vai], target[vai])
+    valid_dl = torch.utils.data.DataLoader(valid_dt, batch_size=batch_size, shuffle=False)
+
+    best_score = 0
+    best_recall_score = 0
+    best_precision_score = 0
+
+
+    patience = 0
+    for epoch in tqdm(range(epochs)):
+        train_loss = train_loop(train_dl, model, bce_loss_fn, optimizer, device)
+        valid_loss, pred= test_loop(valid_dl, model, bce_loss_fn, device)
+        # 이진분류
+        pred = (pred > 0.5).astype(int)
+        f1 = f1_score(target[vai], pred)
+        recall = recall_score(target[vai], pred)
+        precision = precision_score(target[vai], pred)
+
+        patience += 1
+
+        if best_score < f1:
+            patience = 0
+            best_score = f1
+            best_recall_score = recall
+            best_precision_score = precision
+            best_pred = pred
+            torch.save(model.state_dict(), f"{DATA_PATH_2}model_세정력추가_class_{i}.pth")
+
+        print("f1_score_1:", f1)
+        print("recall:", recall)
+        print("precision:", precision)
+        print("train_loss:", train_loss)
+        print("valid_loss:", valid_loss)
+        if patience == 5:
+            break
+
+    valid_true_list.append(target[vai])
+    valid_pred_list.append(best_pred)
+
+    print(f"{i} 번째 폴드 best f1_score_1: {best_score}")
+    print(f"{i} 번째 폴드 best recall_score: {best_recall_score}")
+    print(f"{i} 번째 폴드 best precision_score: {best_precision_score}")
+    best_score_list.append(best_score)
+    best_recall_score_list.append(best_recall_score)
+    best_precision_score_list.append(best_precision_score)
+    if is_holdout:
+        break
+
+print(np.mean(best_score_list))
+print(np.mean(best_recall_score_list))
+print(np.mean(best_precision_score_list))
+
+
+
+"""# Auto_labeling"""
+
+pred_list = np.concatenate(valid_pred_list)
+true_list = np.concatenate(valid_true_list)
+
+best = []
+best_th = 0
+best_precision = 0
+for i in np.arange(0.5, 0.95, 0.01):
+    pred = (pred_list > i).astype(int)
+    precision = precision_score(true_list, pred)
+    if best_precision < precision:
+        best_precision = precision
+        best_th = i
+best_th, best_precision
+
+(pred_list > 0.5).sum()
+
+pred_list.shape
+
+true_list.sum()
+
+th_lst = []
+pre_lst = []
+
+for i in np.arange(0.5, 1, 0.01):
+    pred = (pred_list > i).astype(int)
+    precision = precision_score(true_list, pred)
+    th_lst.append(i)
+    pre_lst.append(precision)
+    if precision >= 0.95:
+        print(i)
+
+import matplotlib.pyplot as plt
+
+plt.plot(th_lst, pre_lst)
+plt.show
+
+test = pd.read_csv(f"{DATA_PATH_3}최종.csv")
+test
+
+test_token = tokenizer(test['content'].tolist(), padding="max_length", truncation=True)
+
+test_input_ids = np.array(test_token['input_ids'])
+test_attention_mask = np.array(test_token['attention_mask'])
+test_token_type_ids = np.array(test_token['token_type_ids'])
+
+test_input_ids.shape, test_attention_mask.shape, test_token_type_ids.shape
+
+batch_size = 64
+
+test_dt = ReviewDataset(test_input_ids, test_attention_mask, test_token_type_ids)
+test_dl = torch.utils.data.DataLoader(test_dt, batch_size=batch_size, shuffle = False)
+
+pred_list = []
+for i in range(n_splits):
+    model = Net(model_name).to(device)
+    state_dict = torch.load(f"{DATA_PATH_2}model_세정력추가_class_{i}.pth") # 가중치 불러오기
+    model.load_state_dict(state_dict) # 모델에 가중치 세팅
+
+    _, pred = test_loop(test_dl, model, bce_loss_fn, device)
+    pred_list.append(pred)
+
+pred = np.mean(pred_list, axis=0)
+
+# 세정력/거품 0.3089527027027027
+
+th_lst = [0.5, 0.6, 0.7, 0.8, 0.9]
+for th in th_lst:
+    print(th, ((pred > th).astype(int)).mean()) # 비율
+
+pred = (pred >= 0.5).astype(int)
+test['세정력'] = pred
+
+test
+
+test[test['세정력'] == 1]
+
+test.to_csv(f"{DATA_PATH}세정력_재학습_완.csv", index=False, encoding='utf-8-sig')
